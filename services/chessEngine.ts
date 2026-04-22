@@ -1,7 +1,13 @@
-import type { Evaluation, IChessJs, ChessJsMove, Piece } from '../types';
+import type { Evaluation, EvaluationBreakdown, IChessJs, ChessJsMove, Piece, EngineConfig, MoveCandidate } from '../types';
 import { PIECE_VALUES, PST, CASTLING_BONUS, CHECK_PENALTY } from '../constants';
+import { ModularEvaluator } from './evaluation/ModularEvaluator';
+import { MaterialComponent, PieceSquareTablesComponent, CastlingRightsComponent, CheckPenaltyComponent } from './evaluation/components/BasicComponents';
+import { PassedPawnsComponent, DoubledPawnsComponent, IsolatedPawnsComponent } from './evaluation/components/PawnStructure';
+import { CenterControlComponent, PieceMobilityComponent, BishopPairComponent, KnightOutpostsComponent, RookOpenFileComponent } from './evaluation/components/PositionalComponents';
+import { PRESET_BASIC } from './evaluation/presets';
 
 const MAX_SEARCH_DEPTH = 10; // Per-move search depth for simulation
+const EVAL_CONVERGENCE_THRESHOLD = 10; // Centipawns - early exit if eval stable
 
 class ChessEngine {
   private game: IChessJs;
@@ -10,34 +16,100 @@ class ChessEngine {
   private startTime = 0;
   private isThinking = false;
   private currentBestMove: string | null = null;
+  private evaluator: ModularEvaluator;
+  private config: EngineConfig;
+  private moveCandidates: MoveCandidate[] = [];
+  private previousEval: number | null = null;
+  private stableDepthCount: number = 0;
 
-  constructor(onUpdate: (update: any) => void) {
+  constructor(onUpdate: (update: any) => void, config: EngineConfig = PRESET_BASIC) {
     this.game = new Chess();
     this.onUpdate = onUpdate;
+    this.config = config;
+    
+    // Initialize evaluator with all available components
+    this.evaluator = new ModularEvaluator([
+      new MaterialComponent(),
+      new PieceSquareTablesComponent(),
+      new CastlingRightsComponent(),
+      new CheckPenaltyComponent(),
+      new PassedPawnsComponent(),
+      new DoubledPawnsComponent(),
+      new IsolatedPawnsComponent(),
+      new CenterControlComponent(),
+      new PieceMobilityComponent(),
+      new BishopPairComponent(),
+      new KnightOutpostsComponent(),
+      new RookOpenFileComponent(),
+    ]);
+  }
+
+  public setConfig(config: EngineConfig) {
+    this.config = config;
+  }
+
+  public getConfig(): EngineConfig {
+    return this.config;
+  }
+
+  public getEvaluator(): ModularEvaluator {
+    return this.evaluator;
   }
 
   public stop() {
     this.isThinking = false;
   }
 
-  public async findBestMove(fen: string, searchDepth: number = MAX_SEARCH_DEPTH): Promise<string | null> {
+  public async findBestMove(fen: string, searchDepth?: number): Promise<string | null> {
     this.isThinking = true;
     this.game.load(fen);
     this.nodes = 0;
     this.startTime = performance.now();
     this.currentBestMove = null;
+    this.moveCandidates = [];
+    this.previousEval = null;
+    this.stableDepthCount = 0;
 
-    for (let depth = 1; depth <= searchDepth; depth++) {
+    // Use config depth if not specified
+    const maxDepth = searchDepth ?? this.config.depth;
+
+    for (let depth = 1; depth <= maxDepth; depth++) {
         if (!this.isThinking) break;
 
-        const result = this.negamax(depth, -Infinity, Infinity);
+        const result = this.negamax(depth, -Infinity, Infinity, true); // true = isRoot
         this.currentBestMove = result.move;
+        const breakdown = this.evaluateWithBreakdown();
         
         const nps = this.nodes / ((performance.now() - this.startTime) / 1000);
+        
+        // Check for eval convergence (early exit optimization)
+        if (this.previousEval !== null && 
+            Math.abs(breakdown.total - this.previousEval) < EVAL_CONVERGENCE_THRESHOLD) {
+          this.stableDepthCount++;
+          if (this.stableDepthCount >= 2 && depth >= 3) {
+            // Eval hasn't changed significantly for 2 depths, we can exit early
+            this.onUpdate({
+                depth,
+                bestMove: this.currentBestMove,
+                evaluation: this.breakdownToLegacyEval(breakdown),
+                breakdown,
+                candidates: this.moveCandidates,
+                nodes: this.nodes,
+                nps: Math.round(nps),
+            });
+            break;
+          }
+        } else {
+          this.stableDepthCount = 0;
+        }
+        this.previousEval = breakdown.total;
+
         this.onUpdate({
             depth,
             bestMove: this.currentBestMove,
-            evaluation: this.evaluate(),
+            evaluation: this.breakdownToLegacyEval(breakdown),
+            breakdown,
+            candidates: this.moveCandidates,
             nodes: this.nodes,
             nps: Math.round(nps),
         });
@@ -49,44 +121,39 @@ class ChessEngine {
     return this.currentBestMove;
   }
   
+  /**
+   * Evaluate using the modular evaluation system with detailed breakdown
+   */
+  private evaluateWithBreakdown(): EvaluationBreakdown {
+    return this.evaluator.evaluate(this.game, this.config);
+  }
+
+  /**
+   * Legacy evaluation for backward compatibility
+   */
   private evaluate(): Evaluation {
-    if (this.game.in_checkmate()) {
-      const total = this.game.turn() === 'w' ? -Infinity : Infinity;
-      return { material: 0, kingSafety: 0, checkmate: total, draw: 0, total };
+    const breakdown = this.evaluateWithBreakdown();
+    return this.breakdownToLegacyEval(breakdown);
+  }
+
+  /**
+   * Convert breakdown to legacy evaluation format
+   */
+  private breakdownToLegacyEval(breakdown: EvaluationBreakdown): Evaluation {
+    if (breakdown.total === -Infinity) {
+      return { material: 0, kingSafety: 0, checkmate: breakdown.total, draw: 0, total: breakdown.total };
     }
-    if (this.game.in_draw() || this.game.in_stalemate()) {
+    if (breakdown.components['draw'] !== undefined) {
       return { material: 0, kingSafety: 0, checkmate: 0, draw: 1, total: 0 };
     }
 
-    let material = 0;
-    let kingSafety = 0;
-    const fen = this.game.fen();
-    const [boardState, turn, castling] = fen.split(' ');
-
-    for (let i = 0; i < 8; i++) {
-        for (let j = 0; j < 8; j++) {
-            const square = String.fromCharCode(97 + j) + (8 - i);
-            const piece = this.game.get(square);
-            if (piece) {
-                const pstIndex = i * 8 + j;
-                const pstValue = piece.color === 'w' ? PST[piece.type][pstIndex] : PST[piece.type][63 - pstIndex];
-                const value = PIECE_VALUES[piece.type] + pstValue;
-                material += piece.color === 'w' ? value : -value;
-            }
-        }
-    }
-
-    if (castling.includes('K') || castling.includes('Q')) kingSafety += CASTLING_BONUS;
-    if (castling.includes('k') || castling.includes('q')) kingSafety -= CASTLING_BONUS;
-    
-    if (this.game.in_check()) {
-       kingSafety += this.game.turn() === 'w' ? CHECK_PENALTY : -CHECK_PENALTY;
-    }
-
-    const perspective = this.game.turn() === 'w' ? 1 : -1;
-    const total = (material + kingSafety) * perspective;
-    
-    return { material, kingSafety, checkmate: 0, draw: 0, total };
+    return {
+      material: breakdown.components['material'] || 0,
+      kingSafety: (breakdown.components['castling-rights'] || 0) + (breakdown.components['check-penalty'] || 0),
+      checkmate: 0,
+      draw: 0,
+      total: breakdown.total,
+    };
   }
   
   private orderMoves(moves: ChessJsMove[]): ChessJsMove[] {
@@ -104,10 +171,10 @@ class ChessEngine {
       });
   }
 
-  private negamax(depth: number, alpha: number, beta: number): { value: number, move: string | null } {
+  private negamax(depth: number, alpha: number, beta: number, isRoot: boolean = false): { value: number, move: string | null } {
     if (depth === 0 || !this.isThinking) {
       this.nodes++;
-      return { value: this.evaluate().total, move: null };
+      return { value: this.evaluateWithBreakdown().total, move: null };
     }
 
     let max = -Infinity;
@@ -115,18 +182,32 @@ class ChessEngine {
     
     const moves = this.game.moves({ verbose: true });
     if (moves.length === 0) { // Handle stalemate/checkmate at leaf
-        return { value: this.evaluate().total, move: null };
+        return { value: this.evaluateWithBreakdown().total, move: null };
     }
 
     const orderedMoves = this.orderMoves(moves);
 
+    // Track candidates at root for visualization
+    if (isRoot && depth === this.config.depth) {
+      this.moveCandidates = [];
+    }
+
     for (const move of orderedMoves) {
       this.game.move(move.san);
-      const { value } = this.negamax(depth - 1, -beta, -alpha);
+      const { value } = this.negamax(depth - 1, -beta, -alpha, false);
       const score = -value;
       this.game.undo();
       
       if (!this.isThinking) break;
+
+      // Track move candidates at root
+      if (isRoot && depth === this.config.depth) {
+        this.moveCandidates.push({
+          move: move.san,
+          score,
+          depth,
+        });
+      }
 
       if (score > max) {
         max = score;
@@ -135,7 +216,7 @@ class ChessEngine {
       alpha = Math.max(alpha, score);
 
       if (alpha >= beta) {
-        break; // Pruning
+        break; // Alpha-beta pruning
       }
     }
     

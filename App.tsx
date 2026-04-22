@@ -3,10 +3,13 @@ import Chessboard from './components/Chessboard';
 import EngineControls from './components/EngineControls';
 import EngineInfo from './components/EngineInfo';
 import GeminiAnalysis from './components/GeminiAnalysis';
+import ComponentConfig from './components/ComponentConfig';
+import EvaluationBreakdown from './components/EvaluationBreakdown';
 import ChessEngine from './services/chessEngine';
 import { getTalStyleAnalysis } from './services/geminiService';
 import { STARTING_FEN } from './constants';
-import { EngineState, type EngineUpdate, type IChessJs, Color } from './types';
+import { PRESET_BASIC } from './services/evaluation/presets';
+import { EngineState, type EngineUpdate, type IChessJs, Color, type EngineConfig } from './types';
 
 // Add game_over to IChessJs in types.ts if it's missing
 declare global {
@@ -25,6 +28,7 @@ function App() {
   const [legalMoves, setLegalMoves] = useState<string[]>([]);
   const [lastMove, setLastMove] = useState<{ from: string; to: string } | null>(null);
   const [orientation, setOrientation] = useState<Color>('w');
+  const [engineConfig, setEngineConfig] = useState<EngineConfig>(PRESET_BASIC);
   
   const engineRef = useRef<ChessEngine | null>(null);
   const gameRef = useRef<IChessJs>(new Chess());
@@ -38,12 +42,24 @@ function App() {
   }, []);
 
   useEffect(() => {
-    engineRef.current = new ChessEngine(handleEngineUpdate);
+    engineRef.current = new ChessEngine(handleEngineUpdate, engineConfig);
     return () => {
       isSimulatingRef.current = false;
       engineRef.current?.stop();
     };
   }, [handleEngineUpdate]);
+
+  // Update engine config when it changes
+  useEffect(() => {
+    if (engineRef.current) {
+      engineRef.current.setConfig(engineConfig);
+    }
+  }, [engineConfig]);
+
+  const handleConfigChange = useCallback((newConfig: EngineConfig) => {
+    setEngineConfig(newConfig);
+    setEngineUpdate(null); // Clear previous evaluation
+  }, []);
   
   const triggerEngineResponse = useCallback(async () => {
     if (gameRef.current.game_over()) return;
@@ -182,6 +198,7 @@ function App() {
               legalMoves={legalMoves}
               lastMove={lastMove}
               orientation={orientation}
+              moveCandidates={engineUpdate?.candidates}
             />
           </div>
 
@@ -196,8 +213,20 @@ function App() {
               onFlipBoard={handleFlipBoard}
             />
             <EngineInfo engineUpdate={engineUpdate} turn={gameRef.current.turn()} />
-            <GeminiAnalysis analysis={geminiAnalysis} isLoading={isGeminiLoading} />
+            <EvaluationBreakdown 
+              breakdown={engineUpdate?.breakdown || null}
+              allComponents={engineRef.current?.getEvaluator().getAllComponents() || []}
+            />
           </div>
+        </div>
+
+        <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <ComponentConfig
+            config={engineConfig}
+            allComponents={engineRef.current?.getEvaluator().getAllComponents() || []}
+            onConfigChange={handleConfigChange}
+          />
+          <GeminiAnalysis analysis={geminiAnalysis} isLoading={isGeminiLoading} />
         </div>
       </div>
     </div>
